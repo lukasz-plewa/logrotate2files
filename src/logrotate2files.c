@@ -19,10 +19,11 @@
 #define LOG_SIZE_LIMIT  512
 
 struct log_rotate_file {
-  FILE *logfile;         // pointers to files streams
-  int file_pos;          // position to write
-  int file_full;         // file written to full and already rotated
-  pthread_mutex_t file_mx;
+  FILE *logfile[2];         // pointers to files streams
+  int file_pos[2];          // position to write
+  int file_full[2];         // file written to full and already rotated
+  int current;
+  pthread_mutex_t mutex_log;
 };
 
 struct test_container {
@@ -36,7 +37,7 @@ static int putLineToLog(const char *line, ssize_t len, struct log_rotate_file *l
 static void log_destroy(struct log_rotate_file *log);
 void* WriterThread(void *arg);
 void* ReaderThread(void *arg);
-void print_log_file(FILE *file, int starting_pos);
+void print_log_to_file(const char *name, struct log_rotate_file *log);
 
 void generate_input_file(const char *name)
 {
@@ -66,7 +67,7 @@ static struct test_container container = {NULL, NULL, PTHREAD_MUTEX_INITIALIZER}
 int main(int argc, char **argv)
 {
 	pthread_t writer_tid, reader_tid;
-	struct log_rotate_file log = { NULL, 0, 0, PTHREAD_MUTEX_INITIALIZER};
+	struct log_rotate_file log = { {NULL, NULL}, {0, 0}, {0, 0}, 0, PTHREAD_MUTEX_INITIALIZER};
 	int iret;
 
 	if (argc != 2)
@@ -102,8 +103,6 @@ int main(int argc, char **argv)
 	    exit(EXIT_FAILURE);
 	}
 
-
-
 	pthread_join(reader_tid, NULL);
 	pthread_join(writer_tid, NULL);
 	pthread_mutex_destroy(&container.mutex);
@@ -119,20 +118,16 @@ void* ReaderThread(void *arg)
 
   do
   {
-    pthread_mutex_lock(&log->file_mx);
+    pthread_mutex_lock(&log->mutex_log);
     printf("Reader obtained semaphore\n");
-    printf("Log size is:    %d\n", (int)ftell(log->logfile));
-    printf("Log position:   %d\n", log->file_pos);
-    printf("Log is%s overlapped\n\n", (log->file_full ? "" : " not"));
-    if (log->file_full == 0)
-    {
-      print_log_file(log->logfile, 0);
-    }
-    else
-    {
-      print_log_file(log->logfile, log->file_pos);
-    }
-    pthread_mutex_unlock(&log->file_mx);
+    printf("Log size is:     %d\n", (int)ftell(log->logfile[log->current]));
+    printf("Log position:    %d\n", log->file_pos[log->current]);
+    printf("Log current file %d\n", log->current);
+
+
+    print_log_to_file("output.log", log);
+
+    pthread_mutex_unlock(&log->mutex_log);
     printf("Reader released semaphore\n");
     usleep(1000000);
   } while(1);
@@ -186,46 +181,52 @@ void* WriterThread(void *arg)
 }
 
 /* *****************************************************************************
- *
+ * print_log_to_file("output.log", log);
  * ****************************************************************************/
-void print_log_file(FILE *file, int starting_pos)
+void print_log_to_file(const char *name, struct log_rotate_file *log)
 {
   char *line = NULL;
   size_t line_len = 0;
   FILE *fd_out = NULL;
 
-  fd_out = fopen("output.log", "w+");
+  fd_out = fopen(name, "w+");
 
   line = malloc(1024);
   if (line == NULL)
     line_len = 0;
   else
     line_len = 1024;
-  if (starting_pos == 0)
+
+  if (log->current == 0)
   {
-    fseek(file, 0, SEEK_SET);
-    while (getline(&line, &line_len, file) > 0)
+    if (log->file_full[1])
+    {
+      fseek(log->logfile[1], 0, SEEK_SET);
+      while (getline(&line, &line_len, log->logfile[1]) > 0)
+      {
+        fprintf(fd_out, "%s", line);
+      }
+    }
+    fseek(log->logfile[0], 0, SEEK_SET);
+    while (getline(&line, &line_len, log->logfile[0]) > 0)
     {
       fprintf(fd_out, "%s", line);
     }
   }
   else
   {
-    fseek(file, starting_pos, SEEK_SET);
-    while (getline(&line, &line_len, file) > 0)
+    fseek(log->logfile[0], 0, SEEK_SET);
+    while (getline(&line, &line_len, log->logfile[0]) > 0)
     {
       fprintf(fd_out, "%s", line);
     }
-    fseek(file, 0, SEEK_SET);
-    while (getline(&line, &line_len, file) > 0)
+    fseek(log->logfile[1], 0, SEEK_SET);
+    while (getline(&line, &line_len, log->logfile[1]) > 0)
     {
       fprintf(fd_out, "%s", line);
-      if (ftell(file) >= starting_pos)
-      {
-        break;
-      }
     }
   }
+
   fclose(fd_out);
   free(line);
 }
@@ -236,26 +237,34 @@ void print_log_file(FILE *file, int starting_pos)
  * ****************************************************************************/
 static int putLineToLog(const char *line, ssize_t len, struct log_rotate_file *log)
 {
+  int cur;
   if (line == NULL || len < 0 || log == NULL)
   {
     printf("Wrong line contents\n");
     return -1;
   }
-  pthread_mutex_lock(&log->file_mx);
-  printf("Inserting line to file at pos %d\n", log->file_pos);
+  pthread_mutex_lock(&log->mutex_log);
+  cur = log->current;
+  printf("Inserting line to file %d at pos %d\n", cur, log->file_pos[cur]);
   sleep(1);
-  fseek(log->logfile, log->file_pos, SEEK_SET);
-  fwrite(line, len, 1, log->logfile);
-  log->file_pos = ftell(log->logfile);
+  fseek(log->logfile[cur], log->file_pos[cur], SEEK_SET);
+  fwrite(line, len, 1, log->logfile[cur]);
+  log->file_pos[cur] = ftell(log->logfile[cur]);
   printf("Inserted %d bytes\n", (int)len);
-  if (log->file_pos > LOG_SIZE_LIMIT)
+
+  if (log->file_pos[cur] > LOG_SIZE_LIMIT)
   {
-    printf("Size limit %d reached, rotating file.\n", LOG_SIZE_LIMIT);
-    fflush(log->logfile);
-    log->file_full = 1;
-    log->file_pos = 0;
+    printf("Size limit %d reached in file %d, rotating file.\n", LOG_SIZE_LIMIT,cur);
+    fflush(log->logfile[cur]);
+    log->file_full[cur] = 1;
+    cur = ((cur + 1) % 2);
+    log->file_pos[cur] = 0;
+    log->current = cur;
+    if (ftruncate(fileno(log->logfile[cur]), 0) == -1){
+      perror("Could not truncate");
+    }
   }
-  pthread_mutex_unlock(&log->file_mx);
+  pthread_mutex_unlock(&log->mutex_log);
   return 0;
 }
 
@@ -264,10 +273,11 @@ static int putLineToLog(const char *line, ssize_t len, struct log_rotate_file *l
  * ****************************************************************************/
 static void log_destroy(struct log_rotate_file *log)
 {
-  pthread_mutex_lock(&log->file_mx);
-  fclose(log->logfile);
-  pthread_mutex_unlock(&log->file_mx);
-  pthread_mutex_destroy(&log->file_mx);
+  pthread_mutex_lock(&log->mutex_log);
+  fclose(log->logfile[0]);
+  fclose(log->logfile[1]);
+  pthread_mutex_unlock(&log->mutex_log);
+  pthread_mutex_destroy(&log->mutex_log);
 }
 
 /* *****************************************************************************
@@ -276,19 +286,21 @@ static void log_destroy(struct log_rotate_file *log)
 static int initLog(struct log_rotate_file *log)
 {
   int ret = EXIT_SUCCESS;
+  const char *log_name[2] = {"loga.log", "logb.log"};
+  int i;
 
-  pthread_mutex_lock(&log->file_mx);
-  log->logfile = fopen("log.log", "w+");
-  if (log->logfile == NULL)
+  pthread_mutex_lock(&log->mutex_log);
+
+  for(i = 0; i < 2; i++)
   {
-    printf("Error opening file loga.log");
-    ret = EXIT_FAILURE;
+    log->logfile[i] = fopen(log_name[i], "w+");
+    if (log->logfile[i] == NULL)
+    {
+      printf("Error opening file %s\n", log_name[i]);
+      ret = EXIT_FAILURE;
+      break;
+    }
   }
-  else
-  {
-    printf("Log file prepared.\n");
-    ret = EXIT_SUCCESS;
-  }
-  pthread_mutex_unlock(&log->file_mx);
+  pthread_mutex_unlock(&log->mutex_log);
   return ret;
 }
