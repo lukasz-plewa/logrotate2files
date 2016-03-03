@@ -16,13 +16,17 @@
 #include <time.h>
 #include <semaphore.h>
 
-#define LOG_SIZE_LIMIT  512
+#define LOG_SIZE_LIMIT    256
+#define LOG_FILES_CNT_MAX 8
+#define LOG_FILENAME_LEN  16
 
 struct log_rotate_file {
-  FILE *logfile[2];         // pointers to files streams
-  int file_pos[2];          // position to write
-  int file_full[2];         // file written to full and already rotated
+  FILE *logfile[LOG_FILES_CNT_MAX];                 // pointers to files streams
+  int file_pos[LOG_FILES_CNT_MAX];                  // position to write
+  int file_full[LOG_FILES_CNT_MAX];                 // file written to full and already rotated
+  char logname[LOG_FILES_CNT_MAX][LOG_FILENAME_LEN];// strings with log file name
   int current;
+  int files_cnt;
   pthread_mutex_t mutex_log;
 };
 
@@ -32,7 +36,7 @@ struct test_container {
   pthread_mutex_t mutex;
 };
 
-static int initLog(struct log_rotate_file *log);
+static int initLog(struct log_rotate_file *log, int files_cnt);
 static int putLineToLog(const char *line, ssize_t len, struct log_rotate_file *log);
 static void log_destroy(struct log_rotate_file *log);
 void* WriterThread(void *arg);
@@ -67,7 +71,7 @@ static struct test_container container = {NULL, NULL, PTHREAD_MUTEX_INITIALIZER}
 int main(int argc, char **argv)
 {
 	pthread_t writer_tid, reader_tid;
-	struct log_rotate_file log = { {NULL, NULL}, {0, 0}, {0, 0}, 0, PTHREAD_MUTEX_INITIALIZER};
+	struct log_rotate_file log;
 	int iret;
 
 	if (argc != 2)
@@ -76,16 +80,15 @@ int main(int argc, char **argv)
 	  return EXIT_FAILURE;
 	}
 
-//	generate_input_file(argv[1]);
-//  return 0;
-	container.log = &log;
-	container.input_file_name = argv[1];
-
-	if (initLog(&log) != EXIT_SUCCESS)
+	if (initLog(&log, 5) != EXIT_SUCCESS)
 	{
 	  printf("Error initializing LOG file\n");
 	  return EXIT_FAILURE;
 	}
+	//  generate_input_file(argv[1]);
+	//  return 0;
+	container.log = &log;
+	container.input_file_name = argv[1];
 
 	iret = pthread_create(&writer_tid, NULL, WriterThread, (void*)&container);
 	if (iret)
@@ -188,6 +191,8 @@ void print_log_to_file(const char *name, struct log_rotate_file *log)
   char *line = NULL;
   size_t line_len = 0;
   FILE *fd_out = NULL;
+  int cur = log->current;           // index of currently written log file
+  int itr = cur;                    // index for reading files
 
   fd_out = fopen(name, "w+");
 
@@ -197,35 +202,25 @@ void print_log_to_file(const char *name, struct log_rotate_file *log)
   else
     line_len = 1024;
 
-  if (log->current == 0)
+  printf("Will print contents of %d files\n", log->files_cnt);
+
+  do
   {
-    if (log->file_full[1])
+    itr = ((itr + 1) % log->files_cnt);
+    if (log->file_full[itr] || log->current == itr)   /* skip empty files but print current*/
     {
-      fseek(log->logfile[1], 0, SEEK_SET);
-      while (getline(&line, &line_len, log->logfile[1]) > 0)
+      printf("Printing file %d\n", itr);
+      fseek(log->logfile[itr], 0, SEEK_SET);
+      while (getline(&line, &line_len, log->logfile[itr]) > 0)
       {
         fprintf(fd_out, "%s", line);
       }
     }
-    fseek(log->logfile[0], 0, SEEK_SET);
-    while (getline(&line, &line_len, log->logfile[0]) > 0)
+    else
     {
-      fprintf(fd_out, "%s", line);
+      printf("Skipping %d file\n", itr);
     }
-  }
-  else
-  {
-    fseek(log->logfile[0], 0, SEEK_SET);
-    while (getline(&line, &line_len, log->logfile[0]) > 0)
-    {
-      fprintf(fd_out, "%s", line);
-    }
-    fseek(log->logfile[1], 0, SEEK_SET);
-    while (getline(&line, &line_len, log->logfile[1]) > 0)
-    {
-      fprintf(fd_out, "%s", line);
-    }
-  }
+  }while (itr != cur);
 
   fclose(fd_out);
   free(line);
@@ -254,10 +249,10 @@ static int putLineToLog(const char *line, ssize_t len, struct log_rotate_file *l
 
   if (log->file_pos[cur] > LOG_SIZE_LIMIT)
   {
-    printf("Size limit %d reached in file %d, rotating file.\n", LOG_SIZE_LIMIT,cur);
+    printf("Size limit %d reached in file %d, rotating file.\n", LOG_SIZE_LIMIT, cur);
     fflush(log->logfile[cur]);
     log->file_full[cur] = 1;
-    cur = ((cur + 1) % 2);
+    cur = ((cur + 1) % log->files_cnt);
     log->file_pos[cur] = 0;
     log->current = cur;
     if (ftruncate(fileno(log->logfile[cur]), 0) == -1){
@@ -273,9 +268,10 @@ static int putLineToLog(const char *line, ssize_t len, struct log_rotate_file *l
  * ****************************************************************************/
 static void log_destroy(struct log_rotate_file *log)
 {
+  int i;
   pthread_mutex_lock(&log->mutex_log);
-  fclose(log->logfile[0]);
-  fclose(log->logfile[1]);
+  for (i = 0; i < log->files_cnt; i++)
+    fclose(log->logfile[i]);
   pthread_mutex_unlock(&log->mutex_log);
   pthread_mutex_destroy(&log->mutex_log);
 }
@@ -283,24 +279,37 @@ static void log_destroy(struct log_rotate_file *log)
 /* *****************************************************************************
  *
  * ****************************************************************************/
-static int initLog(struct log_rotate_file *log)
+static int initLog(struct log_rotate_file *log, int files_cnt)
 {
   int ret = EXIT_SUCCESS;
-  const char *log_name[2] = {"loga.log", "logb.log"};
   int i;
 
-  pthread_mutex_lock(&log->mutex_log);
-
-  for(i = 0; i < 2; i++)
+  if (!log || files_cnt > LOG_FILES_CNT_MAX)
   {
-    log->logfile[i] = fopen(log_name[i], "w+");
+    printf("%s - Error", __FUNCTION__);
+    return -1;
+  }
+
+  for(i = 0; i < files_cnt; i++)
+  {
+    snprintf(log->logname[i], LOG_FILENAME_LEN, "logwebmon%d.log", i);
+    log->logfile[i] = fopen(log->logname[i], "w+");
     if (log->logfile[i] == NULL)
     {
-      printf("Error opening file %s\n", log_name[i]);
+      printf("Error opening file %s\n", log->logname[i]);
       ret = EXIT_FAILURE;
+      do {
+        fclose(log->logfile[--i]);
+      }
+      while(i);
+      printf("Error opening file\n");
       break;
     }
+    log->file_full[i] = 0;
+    log->file_pos[i] = 0;
   }
-  pthread_mutex_unlock(&log->mutex_log);
+  log->current = 0;
+  log->files_cnt = files_cnt;
+  pthread_mutex_init(&log->mutex_log, NULL);
   return ret;
 }
